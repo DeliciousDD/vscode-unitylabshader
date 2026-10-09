@@ -510,7 +510,7 @@ export default class HLSLDocumentSymbolProvider implements DocumentSymbolProvide
                     const uri = Uri.file(absolutePath);
                     const range = new Range(
                         new Position(symbol.line, symbol.column),
-                        new Position(symbol.endLine, symbol.endColumn)
+                        new Position(symbol.line, symbol.column + symbol.name.length)
                     );
                     const location = new Location(uri, range);
                     

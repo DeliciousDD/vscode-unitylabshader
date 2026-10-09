@@ -87,8 +87,6 @@ export default class HLSLSignatureHelperProvider implements SignatureHelpProvide
             return null;
         }
 
-        vscode.window.showInformationMessage('provideSignatureHelp');
-
         let infos: ParameterInformation[] = [];
         let signature = ident;
         signature += '(';

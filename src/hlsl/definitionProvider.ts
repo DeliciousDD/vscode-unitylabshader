@@ -1,6 +1,7 @@
 import { DefinitionProvider, ImplementationProvider, TypeDefinitionProvider, SymbolInformation, TextDocument, Position, Location, CancellationToken, Definition, workspace, commands, Uri, Range, window } from 'vscode';
 import { CachedSymbolKind } from '../cache/symbolCacheTypes';
 import { join } from 'path';
+import * as fs from 'fs';
 import { getRgPath } from '../common';
 import { EngineContextManager, EngineType } from '../common/engineContext';
 import { SymbolCacheManager, CachedSymbol } from '../cache';
@@ -13,6 +14,19 @@ import { WorkspaceIgnore } from '../utils/WorkspaceIgnore';
 interface CacheEntry {
     results: Location[];
     timestamp: number;
+}
+
+// 调用点参数信息
+interface CallArgument {
+    text: string;
+    type: string | null;
+}
+
+// 函数参数信息
+interface FunctionParam {
+    type: string;
+    name: string;
+    modifiers: string[];
 }
 
 export default class HLSLDefinitionProvider implements DefinitionProvider, ImplementationProvider, TypeDefinitionProvider {
@@ -165,6 +179,588 @@ export default class HLSLDefinitionProvider implements DefinitionProvider, Imple
             this.devLog(`[Function] Error: ${error.message}`);
             return [];
         }
+    }
+
+    /**
+     * 从调用点解析括号内的参数列表（处理嵌套括号和字符串）
+     */
+    private parseCallArgumentList(document: TextDocument, position: Position, funcName: string): CallArgument[] | null {
+        const lineText = document.lineAt(position.line).text;
+        const wordRange = document.getWordRangeAtPosition(position);
+        if (!wordRange) {return null;}
+
+        // 查找函数名后的左括号
+        let searchStart = wordRange.end.character;
+        while (searchStart < lineText.length && /\s/.test(lineText[searchStart])) {
+            searchStart++;
+        }
+        if (searchStart >= lineText.length || lineText[searchStart] !== '(') {
+            return null;
+        }
+
+        // 从左括号开始，找到匹配的右括号（跨行）
+        const startOffset = document.offsetAt(new Position(position.line, searchStart));
+        const fullText = document.getText();
+        let depth = 0;
+        let endOffset = -1;
+        let inString = false;
+        let stringChar = '';
+        let inLineComment = false;
+        let inBlockComment = false;
+
+        for (let i = startOffset; i < fullText.length; i++) {
+            const ch = fullText[i];
+            const next = i + 1 < fullText.length ? fullText[i + 1] : '';
+
+            if (inLineComment) {
+                if (ch === '\n') {inLineComment = false;}
+                continue;
+            }
+            if (inBlockComment) {
+                if (ch === '*' && next === '/') {inBlockComment = false; i++;}
+                continue;
+            }
+            if (inString) {
+                if (ch === '\\') {i++; continue;}
+                if (ch === stringChar) {inString = false;}
+                continue;
+            }
+            if (ch === '/' && next === '/') {inLineComment = true; i++; continue;}
+            if (ch === '/' && next === '*') {inBlockComment = true; i++; continue;}
+            if (ch === '"' || ch === "'") {inString = true; stringChar = ch; continue;}
+            if (ch === '(') {depth++; continue;}
+            if (ch === ')') {
+                depth--;
+                if (depth === 0) {endOffset = i; break;}
+            }
+        }
+
+        if (endOffset === -1) {return null;}
+
+        // 提取括号内的文本
+        const innerText = fullText.substring(startOffset + 1, endOffset);
+        const args = this.splitArgumentList(innerText);
+
+        return args.map(argText => ({
+            text: argText.trim(),
+            type: this.inferExpressionType(argText.trim(), document, position)
+        }));
+    }
+
+    /**
+     * 按顶层逗号拆分参数列表（忽略嵌套括号内的逗号）
+     */
+    private splitArgumentList(text: string): string[] {
+        const args: string[] = [];
+        let depth = 0;
+        let current = '';
+        let inString = false;
+        let stringChar = '';
+
+        for (let i = 0; i < text.length; i++) {
+            const ch = text[i];
+            if (inString) {
+                current += ch;
+                if (ch === '\\' && i + 1 < text.length) {
+                    current += text[++i];
+                    continue;
+                }
+                if (ch === stringChar) {inString = false;}
+                continue;
+            }
+            if (ch === '"' || ch === "'") {
+                inString = true; stringChar = ch; current += ch; continue;
+            }
+            if (ch === '(' || ch === '[' || ch === '{') {depth++; current += ch; continue;}
+            if (ch === ')' || ch === ']' || ch === '}') {depth--; current += ch; continue;}
+            if (ch === ',' && depth === 0) {
+                args.push(current);
+                current = '';
+                continue;
+            }
+            current += ch;
+        }
+        if (current.trim()) {args.push(current);}
+        return args;
+    }
+
+    /**
+     * 简单推断表达式类型（基于字面量、构造函数、变量声明缓存）
+     */
+    private inferExpressionType(expr: string, document: TextDocument, position: Position): string | null {
+        if (!expr) {return null;}
+        const e = expr.trim();
+
+        // 数字字面量
+        if (/^-?\d+\.\d+f?$/.test(e)) {return 'float';}
+        if (/^-?\d+f?$/.test(e)) {return 'int';}
+        if (/^-?\d+(\.\d+)?[lf]$/.test(e)) {return 'double';}
+        if (/^0x[0-9a-fA-F]+$/.test(e)) {return 'int';}
+
+        // 向量/矩阵构造函数：float3(...), half4(...), float4x4(...)
+        const ctorMatch = /^(float|half|double|fixed|int|uint|bool|min16float|min10float|min16int|min12int|min16uint)(\d+)?(x\d+)?\s*\(/.exec(e);
+        if (ctorMatch) {
+            const base = ctorMatch[1];
+            const dim = ctorMatch[2] || '';
+            const mat = ctorMatch[3] || '';
+            return `${base}${dim}${mat}`;
+        }
+
+        // 宏常量（全大写）无法确定类型
+        if (/^[A-Z_][A-Z0-9_]*$/.test(e) && e === e.toUpperCase() && e.length > 1) {
+            return null;
+        }
+
+        // 尝试在当前文件中查找变量声明类型
+        const varType = this.findVariableTypeInDocument(e, document, position);
+        if (varType) {return varType;}
+
+        return null;
+    }
+
+    /**
+     * 在当前文档中查找变量的声明类型
+     */
+    private findVariableTypeInDocument(varName: string, document: TextDocument, position: Position): string | null {
+        const text = maskCommentsPreserveLayout(document.getText());
+        const escaped = varName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+        // 匹配类型 + 变量名 的声明：float3 pos; float4 col = ...;
+        const declRegex = new RegExp(
+            `\\b(?:inout|in|out|const|static|uniform|volatile|precise|row_major|column_major\\s+)*` +
+            `((?:bool|int|uint|half|float|double|fixed|min16float|min10float|min16int|min12int|min16uint|sampler|samplerstate|samplercomparisonstate|texture\\d*d|rwtexture\\d*d|structuredbuffer|rwstructuredbuffer|byteaddressbuffer|rwbyteaddressbuffer)` +
+            `(?:\\d+)?(?:x\\d+)?|[A-Z][A-Za-z0-9_]*)\\s+` +
+            `(?:${escaped})\\b\\s*(?:\\[[^\\]]*\\]\\s*)*[=;,)\\[]`,
+            'g'
+        );
+
+        const cursorOffset = document.offsetAt(position);
+        let bestType: string | null = null;
+        let bestOffset = -1;
+        let m: RegExpExecArray | null;
+        while ((m = declRegex.exec(text)) !== null) {
+            if (m.index < cursorOffset && m.index > bestOffset) {
+                bestOffset = m.index;
+                bestType = m[1];
+            }
+        }
+        return bestType;
+    }
+
+    /**
+     * 从函数签名字符串中解析参数列表
+     */
+    private parseFunctionSignatureParams(signature: string): FunctionParam[] {
+        const params: FunctionParam[] = [];
+        const m = /\(([\s\S]*)\)/.exec(signature);
+        if (!m) {return params;}
+
+        const inner = m[1].trim();
+        if (!inner || inner === 'void') {return params;}
+
+        const argTexts = this.splitArgumentList(inner);
+        for (const arg of argTexts) {
+            let trimmed = arg.trim();
+            if (!trimmed || trimmed === 'void') {continue;}
+
+            // 去掉 HLSL 语义注解：float4 pos : POSITION
+            const colonIdx = this.findTopLevelChar(trimmed, ':');
+            if (colonIdx !== -1) {
+                trimmed = trimmed.substring(0, colonIdx).trim();
+            }
+
+            const modifiers: string[] = [];
+            let remaining = trimmed;
+            const modPattern = /^(inout|in|out|const|static|uniform|volatile|precise|row_major|column_major)\s+/i;
+            let modMatch: RegExpExecArray | null;
+            while ((modMatch = modPattern.exec(remaining)) !== null) {
+                modifiers.push(modMatch[1].toLowerCase());
+                remaining = remaining.substring(modMatch[0].length).trim();
+            }
+
+            // 去掉默认值
+            const eqIdx = this.findTopLevelChar(remaining, '=');
+            if (eqIdx !== -1) {
+                remaining = remaining.substring(0, eqIdx).trim();
+            }
+
+            // 匹配类型 + 名称 + 可选数组
+            // 先提取数组后缀
+            let arraySuffix = '';
+            const arrMatch = /((?:\s*\[[^\]]*\])+)\s*$/.exec(remaining);
+            if (arrMatch) {
+                arraySuffix = arrMatch[1];
+                remaining = remaining.substring(0, remaining.length - arrMatch[0].length).trim();
+            }
+
+            const paramMatch = /^(.+?)(?:\s+([A-Za-z_][A-Za-z0-9_]*))?$/.exec(remaining);
+            if (paramMatch) {
+                let type = (paramMatch[1] || '').trim();
+                const name = (paramMatch[2] || '').trim();
+                if (arraySuffix) {type += arraySuffix.replace(/\s+/g, '');}
+                if (type) {
+                    params.push({ type: this.normalizeTypeName(type), name, modifiers });
+                }
+            }
+        }
+        return params;
+    }
+
+    /**
+     * 查找字符串中顶层（不在括号/字符串内）的指定字符位置
+     */
+    private findTopLevelChar(text: string, ch: string): number {
+        let depth = 0;
+        let inString = false;
+        let stringChar = '';
+        for (let i = 0; i < text.length; i++) {
+            const c = text[i];
+            if (inString) {
+                if (c === '\\') {i++; continue;}
+                if (c === stringChar) {inString = false;}
+                continue;
+            }
+            if (c === '"' || c === "'") {inString = true; stringChar = c; continue;}
+            if (c === '(' || c === '[' || c === '{') {depth++; continue;}
+            if (c === ')' || c === ']' || c === '}') {depth--; continue;}
+            if (depth === 0 && c === ch) {return i;}
+        }
+        return -1;
+    }
+
+    /**
+     * 规范化类型名称（小写、去空格）
+     */
+    private normalizeTypeName(type: string): string {
+        return type.replace(/\s+/g, '').toLowerCase();
+    }
+
+    /**
+     * 检查源类型是否可隐式转换到目标类型（HLSL 简化规则）
+     */
+    private isTypeConvertible(source: string, target: string): boolean {
+        if (source === target) {return true;}
+
+        // 数值类型提升
+        const numericHierarchy: Record<string, number> = {
+            'bool': 0, 'int': 1, 'uint': 2, 'half': 3, 'float': 4, 'double': 5,
+            'min10float': 3, 'min16float': 3, 'min12int': 1, 'min16int': 1, 'min16uint': 2
+        };
+
+        // 精确维度匹配的向量/矩阵
+        const vectorMatch = /^(float|half|double|fixed|int|uint|bool|min16float|min10float|min16int|min12int|min16uint)(\d+)$/.exec(source);
+        const targetVectorMatch = /^(float|half|double|fixed|int|uint|bool|min16float|min10float|min16int|min12int|min16uint)(\d+)$/.exec(target);
+
+        if (vectorMatch && targetVectorMatch) {
+            if (vectorMatch[2] === targetVectorMatch[2]) {
+                const sRank = numericHierarchy[vectorMatch[1]] ?? -1;
+                const tRank = numericHierarchy[targetVectorMatch[1]] ?? -1;
+                if (sRank >= 0 && tRank >= 0 && sRank <= tRank) {return true;}
+            }
+            // 同基数不同维度：float4 -> float3 通常不允许，但构造函数可以
+            // 这里保守处理，不允许隐式截断
+            return false;
+        }
+
+        // 标量提升
+        if (numericHierarchy[source] !== undefined && numericHierarchy[target] !== undefined) {
+            return numericHierarchy[source] <= numericHierarchy[target];
+        }
+
+        // 标量到向量广播（float -> float3）
+        if (targetVectorMatch && numericHierarchy[source] !== undefined) {
+            const tRank = numericHierarchy[targetVectorMatch[1]] ?? -1;
+            if (tRank >= 0 && numericHierarchy[source] <= tRank) {return true;}
+        }
+
+        return false;
+    }
+
+    /**
+     * 对单个重载进行评分
+     * 返回 { countMatch: boolean, typeScore: number }
+     * typeScore: -1 类型不匹配, 0 无法判断, >0 类型匹配程度
+     */
+    private scoreOverloadMatch(callArgs: CallArgument[], defParams: FunctionParam[]): { countMatch: boolean; typeScore: number } {
+        // 参数数量不匹配
+        if (callArgs.length !== defParams.length) {
+            return { countMatch: false, typeScore: -1 };
+        }
+
+        let typeScore = 0;
+        let hasKnownType = false;
+        for (let i = 0; i < callArgs.length; i++) {
+            const arg = callArgs[i];
+            const param = defParams[i];
+
+            if (!arg.type) {
+                continue;
+            }
+            hasKnownType = true;
+
+            const argType = this.normalizeTypeName(arg.type);
+            const paramType = this.normalizeTypeName(param.type);
+
+            if (argType === paramType) {
+                typeScore += 100;
+            } else if (this.isTypeConvertible(argType, paramType)) {
+                typeScore += 60;
+            } else {
+                return { countMatch: true, typeScore: -1 };
+            }
+        }
+
+        // 无参数或类型全部未知时，数量匹配即可
+        if (!hasKnownType) {
+            return { countMatch: true, typeScore: 1 };
+        }
+        return { countMatch: true, typeScore };
+    }
+
+    /**
+     * 从指定位置开始，在文本中查找函数名后匹配的括号对，返回括号内的文本
+     */
+    private extractFunctionParamsAtLine(content: string, lineIndex: number, funcName: string): string | null {
+        const lines = content.split(/\r?\n/);
+        if (lineIndex >= lines.length) {return null;}
+
+        // 找到函数名在行中的位置
+        const lineText = lines[lineIndex];
+        const nameRegex = new RegExp(`\\b${funcName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`);
+        const nameMatch = nameRegex.exec(lineText);
+        if (!nameMatch) {return null;}
+
+        // 将光标移到函数名之后，跨行查找左括号
+        let charIdx = nameMatch.index + nameMatch[0].length;
+        let currentLine = lineIndex;
+        let foundOpenParen = false;
+
+        while (currentLine < lines.length) {
+            const text = lines[currentLine];
+            while (charIdx < text.length) {
+                const c = text[charIdx];
+                if (c === '(') {
+                    foundOpenParen = true;
+                    break;
+                }
+                if (!/\s/.test(c)) {
+                    // 函数名后不是空白也不是左括号，说明不是函数定义
+                    return null;
+                }
+                charIdx++;
+            }
+            if (foundOpenParen) {break;}
+            currentLine++;
+            charIdx = 0;
+        }
+
+        if (!foundOpenParen) {return null;}
+
+        // 从左括号开始，跨行找到匹配的右括号
+        let depth = 0;
+        let inString = false;
+        let stringChar = '';
+        let inLineComment = false;
+        let inBlockComment = false;
+        let paramStartLine = currentLine;
+        let paramStartChar = charIdx + 1;
+        let paramEndLine = -1;
+        let paramEndChar = -1;
+
+        for (let li = currentLine; li < lines.length; li++) {
+            const text = lines[li];
+            const startCh = (li === currentLine) ? charIdx : 0;
+            for (let ci = startCh; ci < text.length; ci++) {
+                const c = text[ci];
+                const next = ci + 1 < text.length ? text[ci + 1] : '';
+
+                if (inLineComment) {
+                    continue;
+                }
+                if (inBlockComment) {
+                    if (c === '*' && next === '/') {inBlockComment = false; ci++;}
+                    continue;
+                }
+                if (inString) {
+                    if (c === '\\') {ci++; continue;}
+                    if (c === stringChar) {inString = false;}
+                    continue;
+                }
+                if (c === '/' && next === '/') {inLineComment = true; continue;}
+                if (c === '/' && next === '*') {inBlockComment = true; ci++; continue;}
+                if (c === '"' || c === "'") {inString = true; stringChar = c; continue;}
+                if (c === '(') {
+                    depth++;
+                    continue;
+                }
+                if (c === ')') {
+                    depth--;
+                    if (depth === 0) {
+                        paramEndLine = li;
+                        paramEndChar = ci;
+                        break;
+                    }
+                }
+            }
+            if (paramEndLine !== -1) {break;}
+            inLineComment = false;
+        }
+
+        if (paramEndLine === -1) {return null;}
+
+        // 拼接参数文本
+        const paramLines: string[] = [];
+        for (let li = paramStartLine; li <= paramEndLine; li++) {
+            const text = lines[li];
+            if (li === paramStartLine && li === paramEndLine) {
+                paramLines.push(text.substring(paramStartChar, paramEndChar));
+            } else if (li === paramStartLine) {
+                paramLines.push(text.substring(paramStartChar));
+            } else if (li === paramEndLine) {
+                paramLines.push(text.substring(0, paramEndChar));
+            } else {
+                paramLines.push(text);
+            }
+        }
+        return paramLines.join('\n');
+    }
+
+    /**
+     * 直接从定义文件读取并解析函数参数列表（支持跨行参数）
+     * 返回按文件路径缓存的文件内容 Map
+     */
+    private resolveOverloadParams(
+        locations: Location[],
+        funcName: string
+    ): Map<string, FunctionParam[] | null> {
+        const result = new Map<string, FunctionParam[] | null>();
+        const fileContentCache = new Map<string, string | null>();
+
+        for (const loc of locations) {
+            const filePath = loc.uri.fsPath;
+            const line = loc.range.start.line;
+            const key = `${filePath}:${line}`;
+
+            if (result.has(key)) {continue;}
+
+            let content = fileContentCache.get(filePath);
+            if (content === undefined) {
+                try {
+                    content = fs.readFileSync(filePath, 'utf-8');
+                } catch {
+                    content = null;
+                }
+                fileContentCache.set(filePath, content);
+            }
+
+            if (content === null) {
+                result.set(key, null);
+                continue;
+            }
+
+            const paramsText = this.extractFunctionParamsAtLine(content, line, funcName);
+            if (paramsText === null) {
+                result.set(key, null);
+                continue;
+            }
+
+            // 构造一个虚拟签名来复用 parseFunctionSignatureParams
+            const virtualSignature = `void ${funcName}(${paramsText})`;
+            const params = this.parseFunctionSignatureParams(virtualSignature);
+            result.set(key, params);
+        }
+
+        return result;
+    }
+
+    /**
+     * 根据调用点参数过滤和排序函数重载
+     * 直接读取定义文件解析完整签名，不依赖符号缓存（支持跨行参数和工作区外的文件）
+     */
+    private filterFunctionOverloadsByCallSite(
+        locations: Location[],
+        callArgs: CallArgument[],
+        funcName: string
+    ): Location[] {
+        if (!callArgs || locations.length <= 1) {return locations;}
+
+        // 解析每个候选位置的函数参数列表
+        const paramsByLocation = this.resolveOverloadParams(locations, funcName);
+
+        interface ScoredOverload {
+            location: Location;
+            key: string;
+            params: FunctionParam[] | null;
+        }
+
+        const scored: ScoredOverload[] = [];
+        let resolvedCount = 0;
+
+        for (const loc of locations) {
+            const key = `${loc.uri.fsPath}:${loc.range.start.line}`;
+            const params = paramsByLocation.get(key) ?? null;
+            if (params !== null) {resolvedCount++;}
+            scored.push({ location: loc, key, params });
+        }
+
+        // 如果没有任何一个位置能解析出参数，无法过滤，返回全部
+        if (resolvedCount === 0) {
+            this.devLog(`[Overload] Could not resolve any signature for ${funcName}, returning all ${locations.length} results`);
+            return locations;
+        }
+
+        let bestTyped: Location[] = [];
+        let bestTypeScore = -1;
+        const countMatched: Location[] = [];
+        const countMismatched: Location[] = [];
+        const unresolved: Location[] = [];
+
+        for (const s of scored) {
+            if (s.params === null) {
+                unresolved.push(s.location);
+                continue;
+            }
+
+            const result = this.scoreOverloadMatch(callArgs, s.params);
+            this.devLog(`[Overload] ${funcName} at ${s.location.uri.fsPath}:${s.location.range.start.line + 1}: params=[${s.params.map(p => p.type).join(', ')}], countMatch=${result.countMatch}, typeScore=${result.typeScore}`);
+
+            if (!result.countMatch) {
+                countMismatched.push(s.location);
+                continue;
+            }
+
+            countMatched.push(s.location);
+            if (result.typeScore > bestTypeScore) {
+                bestTypeScore = result.typeScore;
+                bestTyped = [s.location];
+            } else if (result.typeScore === bestTypeScore && result.typeScore > 0) {
+                bestTyped.push(s.location);
+            }
+        }
+
+        // 有类型最佳匹配
+        if (bestTyped.length > 0 && bestTypeScore > 0) {
+            this.devLog(`[Overload] ✓ Found ${bestTyped.length} best type match(es) + ${unresolved.length} unresolved for ${funcName}(${(callArgs.map(a => a.type || '?')).join(', ')})`);
+            return [...bestTyped, ...unresolved];
+        }
+
+        // 至少有一个参数数量匹配，过滤掉明确不匹配的
+        if (countMatched.length > 0 && countMismatched.length > 0) {
+            this.devLog(`[Overload] ✓ Filtered out ${countMismatched.length} mismatched overload(s), keeping ${countMatched.length + unresolved.length} for ${funcName} (${callArgs.length} args)`);
+            return [...countMatched, ...unresolved];
+        }
+
+        // 没有明确的数量匹配（全部不匹配或全部未解析），保守返回全部
+        this.devLog(`[Overload] No confident count match for ${funcName} (${callArgs.length} args), returning all ${locations.length} results`);
+        return locations;
+    }
+
+    /**
+     * 如果是函数调用，对结果应用重载过滤
+     */
+    private applyOverloadFiltering(locations: Location[], callArgs: CallArgument[] | null, name: string): Location[] {
+        if (!callArgs || locations.length <= 1) {return locations;}
+        return this.filterFunctionOverloadsByCallSite(locations, callArgs, name);
     }
 
     /**
@@ -366,7 +962,7 @@ export default class HLSLDefinitionProvider implements DefinitionProvider, Imple
 				const uri = Uri.file(this.getAbsolutePath(symbol.filePath));
 				const range = new Range(
 					new Position(symbol.line, symbol.column),
-					new Position(symbol.endLine, symbol.endColumn)
+					new Position(symbol.line, symbol.column + symbol.name.length)
 				);
 				results.push(new Location(uri, range));
 			} catch (error) {
@@ -415,7 +1011,13 @@ export default class HLSLDefinitionProvider implements DefinitionProvider, Imple
             let results: Location[] = [];
             let name = document.getText(wordRange);
             this.devLog(`[Search] Looking for: "${name}"`);
-            
+
+            // 解析函数调用点的参数列表（用于重载精确匹配）
+            const callArgs = this.parseCallArgumentList(document, position, name);
+            if (callArgs) {
+                this.devLog(`[Overload] Call site has ${callArgs.length} argument(s): [${callArgs.map(a => a.type || a.text.substring(0, 20)).join(', ')}]`);
+            }
+
             // 初始化文件监听器（首次调用时）
             if (!this.fileWatcher) {
                 this.initFileWatcher();
@@ -472,18 +1074,22 @@ export default class HLSLDefinitionProvider implements DefinitionProvider, Imple
 					if (filteredPersistentResults.length === 0) {
 						this.devLog(`[PersistentCache] Ignored all ${persistentResults.length} results by .gitignore`);
 					} else {
-					this.devLog(`[PersistentCache] ✓ Hit! Returning ${filteredPersistentResults.length} results (time: ${Date.now() - persistentStartTime}ms)`);
-					this.devLog(`[Performance] ========== Total time: ${Date.now() - startTime}ms (persistent), Found: ${filteredPersistentResults.length} ==========`);
-					
-					// 存入定义缓存
-					this.definitionCache.set(cacheKey, {
-						results: filteredPersistentResults,
-						timestamp: Date.now()
-					});
-					
-					resolve(filteredPersistentResults);
-					return;
-					}
+				this.devLog(`[PersistentCache] ✓ Hit! Returning ${filteredPersistentResults.length} results (time: ${Date.now() - persistentStartTime}ms)`);
+
+				// 对函数调用应用重载过滤
+				const overloadFiltered = this.applyOverloadFiltering(filteredPersistentResults, callArgs, name);
+
+				this.devLog(`[Performance] ========== Total time: ${Date.now() - startTime}ms (persistent), Found: ${overloadFiltered.length} ==========`);
+
+				// 存入定义缓存
+				this.definitionCache.set(cacheKey, {
+					results: overloadFiltered,
+					timestamp: Date.now()
+				});
+
+				resolve(overloadFiltered);
+				return;
+				}
 				}
 				
 			this.devLog(`[PersistentCache] ✗ Miss (time: ${Date.now() - persistentStartTime}ms)`);
@@ -614,19 +1220,22 @@ export default class HLSLDefinitionProvider implements DefinitionProvider, Imple
             const sortedResults = this.sortLocationsByPriority(
                 this.filterIgnoredLocations(Array.from(uniqueResults.values()))
             );
-            
+
+            // 对函数调用应用重载精确匹配过滤
+            const finalResults = this.applyOverloadFiltering(sortedResults, callArgs, name);
+
             // 存入缓存
-            if (sortedResults.length > 0) {
+            if (finalResults.length > 0) {
                 this.definitionCache.set(cacheKey, {
-                    results: sortedResults,
+                    results: finalResults,
                     timestamp: Date.now()
                 });
-                this.devLog(`[Cache] Stored ${sortedResults.length} results for "${name}"`);                
+                this.devLog(`[Cache] Stored ${finalResults.length} results for "${name}"`);
                 // 同时存入持久化缓存（如果存在）
                 if (this.symbolCacheManager) {
-                    this.storeResultsToPersistentCache(name, sortedResults, symbolType);
+                    this.storeResultsToPersistentCache(name, finalResults, symbolType);
                 }
-                
+
                 // 限制缓存大小（最多100个条目）
                 if (this.definitionCache.size > 100) {
                     const oldestKey = this.definitionCache.keys().next().value;
@@ -638,9 +1247,9 @@ export default class HLSLDefinitionProvider implements DefinitionProvider, Imple
             }
 
             const totalTime = Date.now() - startTime;
-            this.devLog(`[Performance] ========== Total time: ${totalTime}ms, Found: ${sortedResults.length} ==========`);
+            this.devLog(`[Performance] ========== Total time: ${totalTime}ms, Found: ${finalResults.length} ==========`);
 
-            resolve(sortedResults);
+            resolve(finalResults);
         });
     }
 
@@ -944,7 +1553,7 @@ export default class HLSLDefinitionProvider implements DefinitionProvider, Imple
                 const uri = Uri.file(this.getAbsolutePath(symbol.filePath));
                 const range = new Range(
                     new Position(symbol.line, symbol.column),
-                    new Position(symbol.endLine, symbol.endColumn)
+                    new Position(symbol.line, symbol.column + symbol.name.length)
                 );
                 results.push(new Location(uri, range));
             } catch (error) {
@@ -1289,7 +1898,7 @@ export default class HLSLDefinitionProvider implements DefinitionProvider, Imple
                 const absolutePath = join(rootPath, symbol.filePath);
                 const range = new Range(
                     new Position(symbol.line, symbol.column),
-                    new Position(symbol.endLine, symbol.endColumn)
+                    new Position(symbol.line, symbol.column + symbol.name.length)
                 );
                 results.push(new Location(Uri.file(absolutePath), range));
             }
@@ -1449,21 +2058,9 @@ export default class HLSLDefinitionProvider implements DefinitionProvider, Imple
             }
              
             // 3. 默认行为：查找符号定义
-            const wordRange = document.getWordRangeAtPosition(position);
             const result = await this.getDefinitionLocations(document, position);
             const filteredResult = this.filterIgnoredLocations(Array.isArray(result) ? result : [result]);
-            
-            // 如果结果超过20个，显示快速选择面板
-            if (filteredResult.length > 20 && wordRange) {
-                const selected = await this.showQuickPickForDefinitions(filteredResult, document.getText(wordRange));
-                if (selected) {
-                    resolve(selected);
-                } else {
-                    resolve(filteredResult);
-                }
-            } else {
-                resolve(filteredResult);
-            }
+            resolve(filteredResult);
         });
     }
 
@@ -1473,49 +2070,5 @@ export default class HLSLDefinitionProvider implements DefinitionProvider, Imple
 
     public provideTypeDefinition(document: TextDocument, position: Position, token: CancellationToken): Thenable<Definition> {
         return this.getDefinitionLocations(document, position);
-    }
-
-    private async showQuickPickForDefinitions(locations: Location[], symbolName: string): Promise<Location | Location[] | undefined> {
-        interface DefinitionQuickPickItem {
-            label: string;
-            description?: string;
-            detail?: string;
-            location: Location;
-        }
-
-        const visibleLocations = this.filterIgnoredLocations(locations);
-        const items: DefinitionQuickPickItem[] = await Promise.all(
-            visibleLocations.map(async (loc) => {
-                const doc = await workspace.openTextDocument(loc.uri);
-                const line = doc.lineAt(loc.range.start.line);
-                const preview = line.text.trim();
-                const fileName = loc.uri.fsPath.split(/[\\\/]/).pop() || '';
-                const relativePath = workspace.asRelativePath(loc.uri.fsPath);
-                
-                let symbolType = '$(symbol-misc)';
-                if (preview.match(/^\s*#define/)) {
-                    symbolType = '$(symbol-constant)';
-                } else if (preview.match(/^\s*struct\s+/)) {
-                    symbolType = '$(symbol-struct)';
-                } else if (preview.match(/\w+\s+\w+\s*\(/)) {
-                    symbolType = '$(symbol-method)';
-                }
-
-                return {
-                    label: `${symbolType} ${fileName}:${loc.range.start.line + 1}`,
-                    description: relativePath,
-                    detail: preview,
-                    location: loc
-                };
-            })
-        );
-
-        const selected = await window.showQuickPick(items, {
-            placeHolder: `选择 "${symbolName}" 的定义 (${locations.length} 个结果)`,
-            matchOnDescription: true,
-            matchOnDetail: true
-        });
-
-        return selected ? selected.location : undefined;
     }
 }

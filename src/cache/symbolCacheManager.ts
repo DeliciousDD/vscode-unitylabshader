@@ -253,7 +253,24 @@ export class SymbolCacheManager {
     ): Promise<void> {
         const workerCount = Math.min(SymbolCacheManager.MAX_WORKER_THREADS, files.length);
         const workers: Worker[] = [];
-        const workerPath = path.join(__dirname, 'cache', 'symbolParserWorker.js');
+
+        // 使用 asAbsolutePath 解析 Worker 路径，兼容不同 IDE 环境
+        let workerPath: string;
+        try {
+            workerPath = this.context.asAbsolutePath('out/cache/symbolParserWorker.js');
+        } catch {
+            // 回退到 __dirname 方式
+            workerPath = path.join(__dirname, 'cache', 'symbolParserWorker.js');
+        }
+
+        // 验证 Worker 文件存在
+        if (!fs.existsSync(workerPath)) {
+            console.warn(`[SymbolCache] Worker file not found at: ${workerPath}, falling back to single-threaded parsing`);
+            await this.parseFilesSingleThreaded(files, progress);
+            return;
+        }
+
+        console.log(`[SymbolCache] Using worker path: ${workerPath}`);
 
         // 创建 Worker 线程
         for (let i = 0; i < workerCount; i++) {
@@ -261,7 +278,7 @@ export class SymbolCacheManager {
                 const worker = new Worker(workerPath);
                 workers.push(worker);
             } catch (error) {
-                console.error('Failed to create worker:', error);
+                console.error(`[SymbolCache] Failed to create worker ${i}:`, error);
             }
         }
 

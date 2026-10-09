@@ -2,6 +2,7 @@
 // Import the module and reference it with the alias vscode in your code below
 import * as vscode from 'vscode';
 import * as path from 'path';
+import * as fs from 'fs';
 
 import { setHlslExtensions, setRgPath } from './common';
 import { EngineContextManager } from './common/engineContext';
@@ -22,22 +23,64 @@ import { SemanticAnalyzer } from './analysis/semanticAnalyzer';
 import { VariantAnalyzer } from './analysis/variantAnalyzer';
 import { MobileAnalyzer } from './mobile';
 
-// Unity Shader 支持的文件类型
-const documentSelector = [
+// Unity Shader 支持的文件类型（同时支持 unityshader、内置 hlsl 和 shaderlab 语言 ID）
+const documentSelector: vscode.DocumentSelector = [
     { language: 'unityshader', scheme: 'file' },
     { language: 'unityshader', scheme: 'untitled' },
+    { language: 'hlsl', scheme: 'file' },
+    { language: 'hlsl', scheme: 'untitled' },
+    { language: 'shaderlab', scheme: 'file' },
+    { language: 'shaderlab', scheme: 'untitled' },
 ];
 
 /**
- * 获取 VS Code 内置的 ripgrep 路径
+ * 获取 ripgrep 可执行文件路径
+ * 按优先级尝试多个位置，确保在不同 IDE 环境下都能工作
  */
 function getVscodeRgPath(): string {
-    const vscodeAppRoot = vscode.env.appRoot;
-    // VS Code 内置 ripgrep 的路径
-    // Windows: node_modules/@vscode/ripgrep/bin/rg.exe
-    // macOS/Linux: node_modules/@vscode/ripgrep/bin/rg
     const rgExe = process.platform === 'win32' ? 'rg.exe' : 'rg';
-    return path.join(vscodeAppRoot, 'node_modules', '@vscode', 'ripgrep', 'bin', rgExe);
+    const candidatePaths: string[] = [];
+
+    // 1. 优先使用扩展自带的 @vscode/ripgrep
+    try {
+        const bundledRg = require.resolve('@vscode/ripgrep/bin/' + rgExe);
+        candidatePaths.push(bundledRg);
+    } catch {
+        // require.resolve 失败，尝试直接拼接 node_modules 路径
+        candidatePaths.push(path.join(__dirname, '..', 'node_modules', '@vscode', 'ripgrep', 'bin', rgExe));
+    }
+
+    // 2. VS Code 标准内置路径
+    if (vscode.env.appRoot) {
+        candidatePaths.push(path.join(vscode.env.appRoot, 'node_modules', '@vscode', 'ripgrep', 'bin', rgExe));
+    }
+
+    // 3. 其他可能的 IDE 内置路径
+    if (vscode.env.appRoot) {
+        candidatePaths.push(path.join(vscode.env.appRoot, 'node_modules', 'ripgrep', 'bin', rgExe));
+    }
+
+    // 逐个检查候选路径
+    for (const candidate of candidatePaths) {
+        try {
+            if (fs.existsSync(candidate)) {
+                console.log(`[UnityShader] Found ripgrep at: ${candidate}`);
+                return candidate;
+            }
+        } catch {
+            // 继续尝试下一个
+        }
+    }
+
+    // 4. 最后回退到系统 PATH 中的 rg
+    console.warn('[UnityShader] Ripgrep not found in known locations, falling back to system PATH');
+    return 'rg';
+}
+
+// 判断文档是否为 Shader/HLSL 文件（支持多种语言 ID）
+function isShaderDocument(doc: vscode.TextDocument): boolean {
+    const id = doc.languageId;
+    return id === 'unityshader' || id === 'hlsl' || id === 'shaderlab';
 }
 
 // 全局符号缓存管理器实例
@@ -48,12 +91,15 @@ let symbolCacheManager: SymbolCacheManager | null = null;
 export function activate(context: vscode.ExtensionContext) {
 
 	// 控制台输出激活信息
-	console.log('Unity Shader extension is now active!');
+	console.log('[UnityShader] Extension activating...');
+	console.log(`[UnityShader] IDE appName: ${vscode.env.appName}, appRoot: ${vscode.env.appRoot || 'unknown'}`);
+	console.log(`[UnityShader] Platform: ${process.platform}, Node: ${process.version}`);
+	console.log('[UnityShader] Extension path:', context.extensionPath);
 
 	// 初始化引擎上下文管理器
 	const engineContext = EngineContextManager.getInstance();
 	engineContext.initialize(context);
-	console.log('Engine context manager initialized');
+	console.log('[UnityShader] Engine context manager initialized');
 
 	// 初始化符号缓存管理器
 	if (vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0) {
@@ -148,7 +194,7 @@ export function activate(context: vscode.ExtensionContext) {
     // 监听文档变化，触发语义分析
     context.subscriptions.push(
         vscode.workspace.onDidChangeTextDocument(event => {
-            if (event.document.languageId === 'unityshader') {
+            if (isShaderDocument(event.document)) {
                 // 检查配置选项
                 const config = vscode.workspace.getConfiguration('unityshader');
                 const enableSemanticAnalysis = config.get<boolean>('analysis.semanticAnalysis', true);
@@ -175,7 +221,7 @@ export function activate(context: vscode.ExtensionContext) {
     // 监听文档打开，触发初始分析
     context.subscriptions.push(
         vscode.workspace.onDidOpenTextDocument(document => {
-            if (document.languageId === 'unityshader') {
+            if (isShaderDocument(document)) {
                 const config = vscode.workspace.getConfiguration('unityshader');
                 const enableSemanticAnalysis = config.get<boolean>('analysis.semanticAnalysis', true);
                 const enableVariantAnalysis = config.get<boolean>('analysis.variantAnalysis', true);
@@ -198,7 +244,7 @@ export function activate(context: vscode.ExtensionContext) {
     // 监听活动编辑器变化
     context.subscriptions.push(
         vscode.window.onDidChangeActiveTextEditor(editor => {
-            if (editor && editor.document.languageId === 'unityshader') {
+            if (editor && isShaderDocument(editor.document)) {
                 const config = vscode.workspace.getConfiguration('unityshader');
                 const enableSemanticAnalysis = config.get<boolean>('analysis.semanticAnalysis', true);
                 const enableVariantAnalysis = config.get<boolean>('analysis.variantAnalysis', true);
@@ -218,7 +264,7 @@ export function activate(context: vscode.ExtensionContext) {
     // 对当前打开的文档进行初始分析
     if (vscode.window.activeTextEditor) {
         const document = vscode.window.activeTextEditor.document;
-        if (document.languageId === 'unityshader') {
+        if (isShaderDocument(document)) {
             const config = vscode.workspace.getConfiguration('unityshader');
             const enableSemanticAnalysis = config.get<boolean>('analysis.semanticAnalysis', true);
             const enableVariantAnalysis = config.get<boolean>('analysis.variantAnalysis', true);
@@ -252,8 +298,8 @@ export function activate(context: vscode.ExtensionContext) {
             if (event.affectsConfiguration('unityshader.mobile')) {
                 mobileAnalyzer.refreshConfig();
                 // 重新分析当前文档
-                if (vscode.window.activeTextEditor && 
-                    vscode.window.activeTextEditor.document.languageId === 'unityshader') {
+                if (vscode.window.activeTextEditor &&
+                    isShaderDocument(vscode.window.activeTextEditor.document)) {
                     mobileAnalyzer.analyzeDocument(vscode.window.activeTextEditor.document);
                 }
             }
